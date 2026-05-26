@@ -8,6 +8,8 @@
 
 _Cross-device notification relay over an end-to-end encrypted channel._
 
+### 📥 [TossNoti.apk 다운로드](dist/TossNoti.apk?raw=true)
+
 </div>
 
 ---
@@ -76,58 +78,13 @@ _Cross-device notification relay over an end-to-end encrypted channel._
 
 </div>
 
-## 서비스 아키텍처
+## 작동 방식
 
-```mermaid
-flowchart TB
-  subgraph SENDER["📱 송신 태블릿"]
-    direction TB
-    APPS["Source Apps<br/>Instagram · KakaoTalk · Telegram · ..."]
-    LISTENER["AlarmListenerService<br/>송신 모드 + 대상 앱 필터<br/>Dedup 캐시 (5초 TTL)"]
-    METADATA["AppMetadataHelper<br/>loadLabel(pkg)"]
-    RELAY["RelaySender<br/>JSON 페이로드 + OkHttp POST"]
-    CRYPTO_S["CryptoUtils<br/>PIN → SHA-256 → 토픽<br/>PIN → PBKDF2 → AES-256 키<br/>AES-GCM encrypt"]
-    PREFS_S[("SharedPreferences<br/>sender_pin · target_apps")]
-    DB_S[("Room DB<br/>sent logs")]
+<div align="center">
 
-    APPS -->|"OS 콜백<br/>onNotificationPosted"| LISTENER
-    LISTENER --> METADATA
-    METADATA --> RELAY
-    PREFS_S -.-> LISTENER
-    PREFS_S -.-> RELAY
-    RELAY --> CRYPTO_S
-    RELAY --> DB_S
-  end
+<img src="docs/architecture.png" alt="TossNoti service architecture" width="100%" />
 
-  NTFY{{"☁️ ntfy.sh<br/>퍼블릭 메시지 릴레이 (계정 불필요)<br/>토픽 atoss_&lt;24 hex&gt; · 12h 보관<br/>본문 암호문 → 운영자도 못 봄 (E2E)"}}
-
-  subgraph RECEIVER["📞 수신 폰"]
-    direction TB
-    SCREEN["ScreenStateReceiver<br/>SCREEN_OFF → 스트림 끊고 sleep<br/>SCREEN_ON + 10초 → 재연결"]
-    FG["AlarmReceiverService (Foreground)<br/>Long-poll JSON 스트림<br/>지수 백오프 3→30초<br/>since=&lt;id&gt; 누락 메시지 복구"]
-    CRYPTO_R["CryptoUtils<br/>AES-GCM decrypt + tag 검증<br/>실패 시 드롭"]
-    NOTIF["NotificationManager<br/>'[appLabel] title' + 본문"]
-    PREFS_R[("SharedPreferences<br/>receiver_pin · last_message_id")]
-    DB_R[("Room DB<br/>received logs")]
-
-    SCREEN -->|"pause / resume"| FG
-    PREFS_R -.-> FG
-    FG --> CRYPTO_R
-    CRYPTO_R --> NOTIF
-    CRYPTO_R --> DB_R
-  end
-
-  CRYPTO_S ==>|"HTTPS POST<br/>base64(IV ‖ ct ‖ tag)"| NTFY
-  NTFY ==>|"HTTPS GET (long-poll)<br/>?since=&lt;id&gt;"| FG
-
-  classDef external fill:#fef3c7,stroke:#d97706,color:#000
-  classDef storage fill:#f3f4f6,stroke:#6b7280,color:#000
-
-  class NTFY external
-  class PREFS_S,DB_S,PREFS_R,DB_R storage
-```
-
-> 💡 GitHub에서 이 README를 보면 위 다이어그램이 실제 그림으로 렌더링됨. 다른 마크다운 뷰어에선 코드 블록으로 보일 수 있음.
+</div>
 
 ### 핵심 개념
 
