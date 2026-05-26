@@ -70,26 +70,11 @@ _Cross-device notification relay over an end-to-end encrypted channel._
 
 ## 작동 화면
 
-```
-[송신 기기 - 태블릿]              [수신 기기 - 폰]
-┌──────────────────────┐         ┌──────────────────────┐
-│ TossNoti     ● Live  │         │ TossNoti      ● Live │
-│                       │         │                       │
-│ ┌─Sender─┐ ┌─Recv───┐│         │ ┌─Sender─┐ ┌─Recv───┐│
-│ │ 378240 │ │  Off   ││         │ │   —    │ │  Live  ││
-│ │ 3 apps │ │ Phone..│           │ │ 0 apps │ │ Phone..│
-│ └────────┘ └────────┘│         │ └────────┘ └────────┘│
-│                       │         │                       │
-│ Manage                │         │ Pair this device      │
-│ 🔒 Pairing PIN        │         │ Enter sender's PIN    │
-│    378240             │         │   378240              │
-│ 🔔 Target apps        │         │ [Start receiving]     │
-│    3 selected         │         │                       │
-│ [📷 Instagram] [💬 KakaoTalk]  │ Activity              │
-│                       │         │ 📷 Instagram   2m ago│
-│ ✓ Notification access │         │    "John이 ..."       │
-└──────────────────────┘         └──────────────────────┘
-```
+<div align="center">
+
+<img src="docs/preview.png" alt="TossNoti — phone (receiver) paired with tablet (sender)" width="100%" />
+
+</div>
 
 ## 서비스 아키텍처
 
