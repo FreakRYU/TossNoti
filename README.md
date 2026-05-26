@@ -8,7 +8,7 @@
 
 _Cross-device notification relay over an end-to-end encrypted channel._
 
-### 📥 [TossNoti.apk 다운로드](dist/TossNoti.apk?raw=true)
+### 📥 [TossNoti.apk 다운로드](https://github.com/FreakRYU/TossNoti/raw/main/dist/TossNoti.apk)
 
 </div>
 
