@@ -99,7 +99,7 @@ _Cross-device notification relay over an end-to-end encrypted channel._
 NotificationListenerService                              Foreground Service
    ↓ 알림 가로채기                                            ↑ HTTPS 영구 스트림
 PackageManager 조회                                          │ (화면 ON일 때만)
-   ↓ 앱 이름 / 아이콘                                          │
+   ↓ 앱 라벨                                                  │
 RelaySender                                                  ↑
    ↓ AES-256-GCM 암호화                                       │
    ↓ HTTPS POST                                              │
@@ -119,7 +119,7 @@ RelaySender                                                  ↑
 ## 빌드 및 실행
 
 ### 필요 사항
-- **Android Studio Hedgehog** (2023.1.1) 이상 또는 호환 CLI 환경
+- **Android Studio** (AGP 9.x 호환 버전, Narwhal+ 권장) 또는 동등한 CLI 환경
 - **JDK 21** (Eclipse Adoptium / OpenJDK)
 - **Android SDK Platform 36** (Android 16)
 - **Android Build Tools 36.0.0**
@@ -201,7 +201,6 @@ APK 위치: `app/build/outputs/apk/debug/app-debug.apk`
 - 페이로드는 텍스트만 전송하므로 메시지당 약 200-300B (아이콘 미전송).
 - 폰 재부팅 시 수신 서비스 자동 시작 안 됨 (`BootReceiver` 미구현).
 - 수신 폰 화면 12시간 이상 OFF면 ntfy 보관 만료로 일부 알림 손실 가능.
-- Samsung Knox 관리 기기는 사이드로드 자체가 차단됨 — 우회 불가.
 
 ## 기술 스택
 
