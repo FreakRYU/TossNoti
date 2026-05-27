@@ -1,13 +1,11 @@
 package com.example.service
 
 import android.app.*
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.AlarmTossApplication
@@ -28,7 +26,6 @@ class AlarmReceiverService : Service() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
     private var streamJob: Job? = null
-    private var reconnectJob: Job? = null
 
     private lateinit var repository: NotificationRepository
     private val client by lazy {
@@ -40,27 +37,29 @@ class AlarmReceiverService : Service() {
 
     private val notificationIdCounter = AtomicInteger(NOTIFICATION_ID + 1)
 
-    // Tracks the PIN the service was started with so we can transparently
-    // reconnect after screen-off → screen-on cycles.
-    @Volatile private var currentPin: String? = null
-
-    // BroadcastReceiver hooked to system screen on/off events. Registered in
-    // onCreate, unregistered in onDestroy. Used to pause/resume the ntfy stream
-    // and dramatically reduce battery drain while the user isn't looking at
-    // the phone — ntfy.sh holds queued messages for ~12h, and `?since=<id>`
-    // catches us up on reconnect.
-    private var screenStateReceiver: BroadcastReceiver? = null
-
     companion object {
         const val CHANNEL_ID = "alarmtoss_receiver_channel"
         const val SYSTEM_NOTIFICATION_CHANNEL_ID = "alarmtoss_system_channel"
         private const val NOTIFICATION_ID = 9999
-        private const val PREF_KEY_LAST_MSG_PREFIX = "last_message_id_"
 
-        // Debounce so brief screen-wakes (fingerprint unlock, glance) do not
-        // immediately reconnect. ntfy retains messages so a slight delay
-        // costs us nothing.
-        private const val SCREEN_ON_DEBOUNCE_MS = 10_000L
+        // Per-PIN unix-second cursor of the most recently processed message.
+        // Used as ntfy's ?since=<timestamp> on every reconnect. Replaces the
+        // older per-PIN message-ID cursor, which silently failed whenever the
+        // boundary ID had been evicted from ntfy's cache.
+        private const val PREF_KEY_LAST_MSG_TIME_PREFIX = "last_message_time_"
+
+        // Recent-message-ID dedup window. ntfy may resend the boundary
+        // message on ?since=<ts> reconnects (timestamp resolution is one
+        // second), and a notification burst can share the same `time` value,
+        // so we drop already-seen IDs to avoid double-notifying.
+        private const val PREF_KEY_RECENT_IDS_PREFIX = "recent_message_ids_"
+        private const val RECENT_IDS_CAPACITY = 64
+
+        // ntfy.sh free tier holds messages for 12h. If our cursor is empty
+        // (fresh pairing) or older than this, ask for the full window so
+        // cached messages aren't silently dropped on reconnect.
+        private const val NTFY_CACHE_WINDOW_SEC = 12L * 60L * 60L
+        private const val NTFY_CACHE_WINDOW_PARAM = "12h"
 
         private var isServiceRunningStatus = false
 
@@ -72,7 +71,6 @@ class AlarmReceiverService : Service() {
         isServiceRunningStatus = true
         repository = (applicationContext as AlarmTossApplication).repository
         createNotificationChannels()
-        registerScreenStateReceiver()
         Log.i("AlarmReceiverService", "AlarmReceiverService Created")
     }
 
@@ -85,9 +83,7 @@ class AlarmReceiverService : Service() {
             return START_NOT_STICKY
         }
 
-        currentPin = pin
-        val initiallyInteractive = isScreenInteractive()
-        val notification = buildForegroundNotification(pin, paused = !initiallyInteractive)
+        val notification = buildForegroundNotification(pin)
         when {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> {
                 startForeground(
@@ -106,30 +102,15 @@ class AlarmReceiverService : Service() {
             else -> startForeground(NOTIFICATION_ID, notification)
         }
 
-        // Only open the ntfy stream right away if the screen is on. Otherwise
-        // wait for SCREEN_ON to come through screenStateReceiver.
-        if (initiallyInteractive) {
-            startListening(pin)
-        } else {
-            Log.i("AlarmReceiverService", "Service started with screen off — deferring stream until screen-on.")
-        }
+        startListening(pin)
 
         return START_STICKY
     }
 
     override fun onDestroy() {
         isServiceRunningStatus = false
-        reconnectJob?.cancel()
         streamJob?.cancel()
         serviceJob.cancel()
-        screenStateReceiver?.let {
-            try {
-                unregisterReceiver(it)
-            } catch (e: Exception) {
-                Log.w("AlarmReceiverService", "Failed to unregister screenStateReceiver: ${e.message}")
-            }
-        }
-        screenStateReceiver = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -142,76 +123,6 @@ class AlarmReceiverService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ── Screen state plumbing ────────────────────────────────────────────
-
-    private fun registerScreenStateReceiver() {
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_USER_PRESENT)
-        }
-        screenStateReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                when (intent?.action) {
-                    Intent.ACTION_SCREEN_OFF -> onScreenOff()
-                    Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> onScreenOn()
-                }
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(screenStateReceiver, filter)
-        }
-    }
-
-    private fun onScreenOff() {
-        Log.i("AlarmReceiverService", "Screen OFF — suspending ntfy stream to save battery")
-        reconnectJob?.cancel()
-        reconnectJob = null
-        streamJob?.cancel()
-        streamJob = null
-        currentPin?.let { refreshForegroundNotification(it, paused = true) }
-    }
-
-    private fun onScreenOn() {
-        val pin = currentPin ?: return
-        // Already streaming — nothing to do (likely SCREEN_ON arrived while
-        // we were never disconnected, e.g. screen toggled too fast).
-        if (streamJob?.isActive == true) return
-        // Already in the debounce window — don't restart the timer.
-        if (reconnectJob?.isActive == true) return
-
-        Log.d("AlarmReceiverService", "Screen ON — debouncing ${SCREEN_ON_DEBOUNCE_MS / 1000}s before reconnect")
-        reconnectJob = serviceScope.launch {
-            try {
-                delay(SCREEN_ON_DEBOUNCE_MS)
-            } catch (e: CancellationException) {
-                Log.d("AlarmReceiverService", "Debounce cancelled (screen went off again)")
-                return@launch
-            }
-            // The user may have turned the screen back off during the debounce.
-            // PowerManager.isInteractive is cheap and always up-to-date.
-            if (!isScreenInteractive()) {
-                Log.d("AlarmReceiverService", "Screen turned off during debounce — abort reconnect")
-                return@launch
-            }
-            Log.i("AlarmReceiverService", "Reconnecting after screen-on debounce")
-            refreshForegroundNotification(pin, paused = false)
-            startListening(pin)
-        }
-    }
-
-    private fun isScreenInteractive(): Boolean {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        return pm.isInteractive
-    }
-
-    private fun refreshForegroundNotification(pin: String, paused: Boolean) {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mgr.notify(NOTIFICATION_ID, buildForegroundNotification(pin, paused))
-    }
-
     // ── Streaming ────────────────────────────────────────────────────────
 
     private fun startListening(pin: String) {
@@ -219,21 +130,14 @@ class AlarmReceiverService : Service() {
         streamJob = serviceScope.launch {
             val topic = CryptoUtils.deriveTopic(pin)
             val sharedPref = applicationContext.getSharedPreferences("AlarmTossPref", Context.MODE_PRIVATE)
-            val sinceKey = PREF_KEY_LAST_MSG_PREFIX + pin
+            val timeKey = PREF_KEY_LAST_MSG_TIME_PREFIX + pin
+            val recentIdsKey = PREF_KEY_RECENT_IDS_PREFIX + pin
 
             var retryDelay = 3_000L
             while (isActive) {
                 try {
-                    val lastMessageId = sharedPref.getString(sinceKey, null)
-                    val url = buildString {
-                        append("https://ntfy.sh/")
-                        append(topic)
-                        append("/json")
-                        if (!lastMessageId.isNullOrEmpty()) {
-                            append("?since=")
-                            append(lastMessageId)
-                        }
-                    }
+                    val sinceParam = computeSinceParam(sharedPref.getLong(timeKey, 0L))
+                    val url = "https://ntfy.sh/$topic/json?since=$sinceParam"
 
                     Log.i("AlarmReceiverService", "Connecting to ntfy.sh stream at: $url")
                     val request = Request.Builder()
@@ -254,7 +158,7 @@ class AlarmReceiverService : Service() {
                             var line: String? = null
                             while (isActive && reader.readLine().also { line = it } != null) {
                                 line?.let { jsonLine ->
-                                    handleStreamLine(jsonLine, pin, sinceKey)
+                                    handleStreamLine(jsonLine, pin, sharedPref, timeKey, recentIdsKey)
                                 }
                             }
                         }
@@ -271,61 +175,112 @@ class AlarmReceiverService : Service() {
         }
     }
 
-    private fun handleStreamLine(jsonLine: String, pin: String, sinceKey: String) {
+    private fun handleStreamLine(
+        jsonLine: String,
+        pin: String,
+        prefs: SharedPreferences,
+        timeKey: String,
+        recentIdsKey: String,
+    ) {
         try {
             val ntfyObj = JSONObject(jsonLine)
             val event = ntfyObj.optString("event")
             Log.d("AlarmReceiverService", "Stream event=$event size=${jsonLine.length}B")
 
-            if (event == "message") {
-                val rawMsg = ntfyObj.optString("message")
-                val msgId = ntfyObj.optString("id", "")
+            if (event != "message") return
 
-                val decrypted = CryptoUtils.decrypt(rawMsg, pin)
-                if (decrypted == null) {
-                    Log.w("AlarmReceiverService", "Failed to decrypt incoming message (size=${rawMsg.length}); either PIN mismatch or injected garbage. Dropping.")
-                    if (msgId.isNotEmpty()) {
-                        applicationContext.getSharedPreferences("AlarmTossPref", Context.MODE_PRIVATE)
-                            .edit().putString(sinceKey, msgId).apply()
-                    }
-                    return
-                }
+            val rawMsg = ntfyObj.optString("message")
+            val msgId = ntfyObj.optString("id", "")
+            val msgTime = ntfyObj.optLong("time", 0L)
 
-                val detailObj = JSONObject(decrypted)
-                val title = detailObj.optString("title", "알림토스")
-                val message = detailObj.optString("message", "")
-                val packageName = detailObj.optString("packageName", "unknown")
-                val appLabel = detailObj.optString("appLabel", "").ifBlank {
-                    packageName.substringAfterLast(".").replaceFirstChar { it.uppercase() }
-                }
+            if (msgId.isNotEmpty() && msgId in readRecentIds(prefs, recentIdsKey)) {
+                Log.d("AlarmReceiverService", "Dropping duplicate message id=$msgId")
+                return
+            }
 
-                serviceScope.launch {
-                    try {
-                        repository.insertLog(
-                            NotificationLog(
-                                title = title,
-                                message = message,
-                                packageName = packageName,
-                                pin = pin,
-                                isSent = false,
-                                appLabel = appLabel
-                            )
+            val decrypted = CryptoUtils.decrypt(rawMsg, pin)
+            if (decrypted == null) {
+                Log.w("AlarmReceiverService", "Failed to decrypt incoming message (size=${rawMsg.length}); either PIN mismatch or injected garbage. Dropping.")
+                advanceCursor(prefs, timeKey, recentIdsKey, msgId, msgTime)
+                return
+            }
+
+            val detailObj = JSONObject(decrypted)
+            val title = detailObj.optString("title", "알림토스")
+            val message = detailObj.optString("message", "")
+            val packageName = detailObj.optString("packageName", "unknown")
+            val appLabel = detailObj.optString("appLabel", "").ifBlank {
+                packageName.substringAfterLast(".").replaceFirstChar { it.uppercase() }
+            }
+
+            // Mark the cursor synchronously before launching side-effect work
+            // so a rapid-fire duplicate (overlapping reconnect, boundary
+            // replay) is already in the dedup set by the time the next line
+            // is parsed.
+            advanceCursor(prefs, timeKey, recentIdsKey, msgId, msgTime)
+
+            serviceScope.launch {
+                try {
+                    repository.insertLog(
+                        NotificationLog(
+                            title = title,
+                            message = message,
+                            packageName = packageName,
+                            pin = pin,
+                            isSent = false,
+                            appLabel = appLabel
                         )
-                        triggerLocalNotification(title, message, packageName, appLabel)
-                        if (msgId.isNotEmpty()) {
-                            applicationContext.getSharedPreferences("AlarmTossPref", Context.MODE_PRIVATE)
-                                .edit().putString(sinceKey, msgId).apply()
-                        }
-                    } catch (e: Exception) {
-                        Log.e("AlarmReceiverService", "Failed to process received notification payload: ${e.message}", e)
-                    }
+                    )
+                    triggerLocalNotification(title, message, packageName, appLabel)
+                } catch (e: Exception) {
+                    Log.e("AlarmReceiverService", "Failed to process received notification payload: ${e.message}", e)
                 }
-            } else if (event == "keepalive" || event == "open") {
-                // ignore
             }
         } catch (e: Exception) {
             Log.e("AlarmReceiverService", "Error unpacking message JSON: ${e.message}")
         }
+    }
+
+    // ── Cursor + dedup helpers ───────────────────────────────────────────
+
+    private fun computeSinceParam(lastTimeSec: Long): String {
+        val nowSec = System.currentTimeMillis() / 1000L
+        return if (lastTimeSec <= 0L || nowSec - lastTimeSec > NTFY_CACHE_WINDOW_SEC) {
+            NTFY_CACHE_WINDOW_PARAM
+        } else {
+            lastTimeSec.toString()
+        }
+    }
+
+    private fun readRecentIds(prefs: SharedPreferences, key: String): List<String> {
+        val raw = prefs.getString(key, "") ?: ""
+        if (raw.isEmpty()) return emptyList()
+        return raw.split('\n').filter { it.isNotEmpty() }
+    }
+
+    private fun advanceCursor(
+        prefs: SharedPreferences,
+        timeKey: String,
+        recentIdsKey: String,
+        msgId: String,
+        msgTime: Long,
+    ) {
+        val editor = prefs.edit()
+        if (msgTime > 0L) {
+            // Monotonically increasing — don't move the cursor backwards if
+            // events arrive out of order (rare but possible with ?since=
+            // replays at the boundary).
+            val current = prefs.getLong(timeKey, 0L)
+            if (msgTime > current) editor.putLong(timeKey, msgTime)
+        }
+        if (msgId.isNotEmpty()) {
+            val ids = readRecentIds(prefs, recentIdsKey).toMutableList()
+            ids.remove(msgId)
+            ids.add(msgId)
+            while (ids.size > RECENT_IDS_CAPACITY) ids.removeAt(0)
+            editor.putString(recentIdsKey, ids.joinToString("\n"))
+        }
+        editor.apply()
     }
 
     private fun triggerLocalNotification(
@@ -390,7 +345,7 @@ class AlarmReceiverService : Service() {
         }
     }
 
-    private fun buildForegroundNotification(pin: String, paused: Boolean = false): Notification {
+    private fun buildForegroundNotification(pin: String): Notification {
         val resultIntent = Intent(this, com.example.MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -401,17 +356,10 @@ class AlarmReceiverService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val title = if (paused) "TossNoti 절전 대기 중" else "TossNoti 실시간 수신 작동 중"
-        val text = if (paused) {
-            "화면 켜면 자동 재연결 · PIN: $pin"
-        } else {
-            "기기 연동 PIN: $pin (다른 기기로부터 원격 알림 수신 중...)"
-        }
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(com.example.R.mipmap.ic_launcher)
-            .setContentTitle(title)
-            .setContentText(text)
+            .setContentTitle("TossNoti 실시간 수신 작동 중")
+            .setContentText("기기 연동 PIN: $pin (다른 기기로부터 원격 알림 수신 중...)")
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pendingIntent)
             .setOngoing(true)

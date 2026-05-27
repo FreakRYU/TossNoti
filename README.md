@@ -51,9 +51,8 @@ _Cross-device notification relay over an end-to-end encrypted channel._
 
    - **보안 강화** — AES-256-GCM + PBKDF2(100k 라운드) + 토픽 해시화
    - **UI 전면 재설계** — Coinbase 스타일 라이트 테마, Compose Material 3
-   - **배터리 최적화** — 화면 ON/OFF 기반 ntfy 연결 관리 (5-10%/일 → 1-3%/일)
    - **호환성 정비** — Samsung One UI Auto Blocker 대응, FGS 듀얼 타입(`dataSync|specialUse`), Android 7~16 지원
-   - **신뢰성 보강** — 메시지 dedup, 지수 백오프 재연결, `?since=` 누락 메시지 복구
+   - **신뢰성 보강** — 메시지 ID dedup(최근 64개), 지수 백오프 재연결, `?since=<timestamp>` 기반 누락 메시지 복구 (cursor empty/만료 시 `?since=12h` fallback)
    - **사용성 개선** — 앱 선택 Picker(설치된 모든 앱 검색), 권한 안내, 활동 로그 등
 
    총 **30여 개의 개별 개선** 반영.
@@ -64,7 +63,6 @@ _Cross-device notification relay over an end-to-end encrypted channel._
 - 🔐 **종단간 암호화** — AES-256-GCM + PBKDF2(100k 라운드) 키 파생
 - 📱 **앱 선택기** — 송신 기기에 설치된 모든 앱 중 가로챌 대상 선택 (검색 가능)
 - 🏷 **실제 앱 이름 표시** — 인스타 알림은 `[Instagram]`, 카톡은 `[KakaoTalk]` 형식으로 자동 라벨링
-- 🔋 **스마트 절전** — 수신 폰 화면 OFF 시 자동 연결 종료, ON 후 10초 디바운스 재연결 (배터리 5-10%/일 → 1-3%/일)
 - 📦 **중복 제거** — 같은 앱이 알림을 업데이트할 때 (예: "메시지 1개→2개") 중복 전송 방지
 - 🔁 **자동 재연결** — 네트워크 끊겨도 지수 백오프로 재연결, `?since=` 파라미터로 누락 메시지 복구
 - 🗂 **활동 로그** — 송수신 내역 시각화 + 삭제 / 일괄 비우기
@@ -185,7 +183,8 @@ APK 위치: `app/build/outputs/apk/debug/app-debug.apk`
 - ntfy.sh 무료 한도: **하루 250개 메시지**, **메시지당 4KB**. 이 정도는 개인용으로 충분.
 - 페이로드는 텍스트만 전송하므로 메시지당 약 200-300B (아이콘 미전송).
 - 폰 재부팅 시 수신 서비스 자동 시작 안 됨 (`BootReceiver` 미구현).
-- 수신 폰 화면 12시간 이상 OFF면 ntfy 보관 만료로 일부 알림 손실 가능.
+- 수신 서비스가 12시간 이상 중단되면 (네트워크 단절·OS의 백그라운드 종료 등) 그 사이의 알림은 ntfy 보관 만료로 손실 가능.
+- 수신 모드는 ntfy long-poll 연결을 상시 유지하므로 배터리 소모가 일반 메신저 수준임. (Samsung 등 공격적인 OEM의 경우 "배터리 → 제한 없음" 설정 권장)
 
 ## 기술 스택
 
